@@ -218,3 +218,160 @@ func SimulateDAG(N, C, R, D int, p float64) {
 	}
 
 }
+
+// SimulateDAGBenchmark simulates a DAG-based blockchain benchmark
+func SimulateDAGBenchmark(N, C, R, D int, p float64) (txSent int, txConfirmed int, avgConfidence float64) {
+	var wg sync.WaitGroup
+	wg.Add(N)
+
+	inboxes := make([]chan Transaction, N)
+	receivers := make([]chan Transaction, N)
+	var G = createGenesis(D)
+	G1, G2 := G[0], G[1]
+	G1.Hash = "gen1"
+	G2.Hash = "gen2"
+
+	for i := 0; i < N; i++ {
+		inboxes[i] = make(chan Transaction, 100)
+		receivers[i] = make(chan Transaction, 100)
+	}
+
+	var mu sync.Mutex
+	confidenceScores := []int{}
+	transactionTracker := make(map[float64]bool)
+
+	for i := 0; i < N; i++ {
+		go func(i int) {
+			defer wg.Done()
+			HashMap := map[string]Transaction{
+				G1.Hash: G1,
+				G2.Hash: G2,
+			}
+			Nodes := []Transaction{G1, G2}
+			transactions := []Transaction{}
+			exit := false
+
+			for !exit {
+				select {
+				case t, ok := <-receivers[i]:
+					if ok {
+						_, ok1 := HashMap[t.Parents[0]]
+						_, ok2 := HashMap[t.Parents[1]]
+						if ok1 && ok2 {
+							HashMap[t.Hash] = t
+							Nodes = append(Nodes, t)
+						}
+					}
+				case t, ok := <-inboxes[i]:
+					if ok {
+						transactions = append(transactions, t)
+					} else {
+						exit = true
+					}
+				default:
+					if len(transactions) > 0 {
+						t := transactions[len(transactions)-1]
+						transactions = transactions[:len(transactions)-1]
+						t.Parents = pickParents(Nodes)
+						t = mineTransaction(t, D)
+						HashMap[t.Hash] = t
+						Nodes = append(Nodes, t)
+
+						l1 := getLabel(i, C)
+						for j := 0; j < N; j++ {
+							l2 := getLabel(j, C)
+							if i == j || (l1 == "corrupt" && l2 == "honest") {
+								continue
+							}
+							select {
+							case receivers[j] <- t:
+							default:
+							}
+						}
+					}
+				}
+			}
+
+			Confidence := make(map[string]int)
+			Tips := map[string]struct{}{}
+			for h := range HashMap {
+				Tips[h] = struct{}{}
+			}
+			for _, val := range HashMap {
+				if len(val.Parents) < 2 {
+					continue
+				}
+				delete(Tips, val.Parents[0])
+				delete(Tips, val.Parents[1])
+			}
+			for tip := range Tips {
+				visited := map[string]struct{}{}
+				var dfs func(string)
+				dfs = func(h string) {
+					if _, seen := visited[h]; seen {
+						return
+					}
+					visited[h] = struct{}{}
+					Confidence[h]++
+					for _, p := range HashMap[h].Parents {
+						dfs(p)
+					}
+				}
+				dfs(tip)
+			}
+
+			mu.Lock()
+			for h, score := range Confidence {
+				tx := HashMap[h]
+				if !transactionTracker[tx.Amount] {
+					txConfirmed++
+					confidenceScores = append(confidenceScores, score)
+					transactionTracker[tx.Amount] = true
+				}
+			}
+			mu.Unlock()
+		}(i)
+	}
+
+	// Count and send transactions
+	amt := 1.0
+	for round := 0; round < R; round++ {
+		for i := 0; i < N; i++ {
+			for j := 0; j < N; j++ {
+				if i == j {
+					continue
+				}
+				l1 := getLabel(i, C)
+				l2 := getLabel(j, C)
+				if l1 != l2 {
+					continue
+				}
+				if rand.Float64() <= p {
+					tx := Transaction{
+						Sender:   fmt.Sprintf("%s%d", l1, getNum(i, C)),
+						Receiver: fmt.Sprintf("%s%d", l2, getNum(j, C)),
+						Amount:   amt,
+					}
+					inboxes[i] <- tx
+					txSent++
+					amt += 0.01
+				}
+			}
+		}
+	}
+	for i := 0; i < N; i++ {
+		close(inboxes[i])
+	}
+
+	wg.Wait()
+
+	if len(confidenceScores) > 0 {
+		sum := 0
+		for _, s := range confidenceScores {
+			sum += s
+		}
+		avgConfidence = float64(sum) / float64(len(confidenceScores))
+	}
+
+	return txSent, txConfirmed, avgConfidence
+}

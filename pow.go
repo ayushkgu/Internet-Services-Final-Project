@@ -301,3 +301,84 @@ func SimulateBlockchain(N, C, R, D int, p float64) {
 	fmt.Println("Difficulty    =", D)
 	fmt.Println("Winner        =", winnerType)
 }
+
+
+// SimulateBlockchainBenchmark simulates a blockchain benchmark
+func SimulateBlockchainBenchmark(N, C, R, D int, p float64) (txSent int, txConfirmed int, winner string) {
+	inboxes := make([]chan Transaction, N)
+	for i := range N {
+		inboxes[i] = make(chan Transaction, 100)
+	}
+
+	amt := 1.0
+	for round := 0; round < R; round++ {
+		for i := 0; i < N; i++ {
+			for j := 0; j < N; j++ {
+				if i == j {
+					continue
+				}
+				l1 := getLabel(i, C)
+				l2 := getLabel(j, C)
+				if l1 != l2 {
+					continue
+				}
+				if rand.Float64() <= p {
+					tx := Transaction{
+						Sender:   fmt.Sprintf("%s%d", l1, getNum(i, C)),
+						Receiver: fmt.Sprintf("%s%d", l2, getNum(j, C)),
+						Amount:   amt,
+					}
+					amt += 0.01
+					inboxes[i] <- tx
+					txSent++
+				}
+			}
+		}
+	}
+	for i := range N {
+		close(inboxes[i])
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(N)
+	receivers := make([]chan Block, N)
+	genesis := createGenesisBlock(D)
+
+	var winnerChain []Block
+	var winnerType string
+	var winnerMu sync.Mutex
+
+	for i := 0; i < N; i++ {
+		receivers[i] = make(chan Block, N)
+		go func(i int) {
+			defer wg.Done()
+			HashMap := map[string]Block{genesis.Hash: genesis}
+			Counts := make(map[string]int)
+			MaxChain := genesis.Hash
+			txs := []Transaction{}
+			for tx := range inboxes[i] {
+				txs = append(txs, tx)
+			}
+			if len(txs) > 0 {
+				block := generateBlock(MaxChain, txs, D)
+				HashMap[block.Hash] = block
+				Counts[block.Hash] = Counts[block.PrevHash] + 1
+				MaxChain = block.Hash
+			}
+			chain := buildBlockChain(HashMap, genesis, MaxChain)
+			winnerMu.Lock()
+			if len(chain) > len(winnerChain) {
+				winnerChain = chain
+				winnerType = getLabel(i, C)
+			}
+			winnerMu.Unlock()
+		}(i)
+	}
+	wg.Wait()
+
+	for _, b := range winnerChain {
+		txConfirmed += len(b.Transactions)
+	}
+
+	return txSent, txConfirmed, winnerType
+}
