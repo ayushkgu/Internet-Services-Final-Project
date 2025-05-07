@@ -1,5 +1,3 @@
-// To run benchmarks run 'go run tester.go dag.go pow.go'
-
 package main
 
 import (
@@ -10,6 +8,11 @@ import (
 	"time"
 )
 
+/*
+	terminal command to run main():
+	"go run tester.go pow.go dag.go"
+*/
+
 type BenchmarkConfig struct {
 	N int
 	C int
@@ -19,13 +22,17 @@ type BenchmarkConfig struct {
 }
 
 func main() {
-	configs := []BenchmarkConfig{
-		{N: 4, C: 1, R: 1, D: 1, p: 0.5},
-		{N: 6, C: 2, R: 2, D: 2, p: 0.75},
-		{N: 8, C: 3, R: 3, D: 2, p: 1.0},
-		{N: 10, C: 4, R: 3, D: 2, p: 0.8}, // More nodes
-		{N: 6, C: 1, R: 3, D: 3, p: 0.5},  // Higher difficulty
-		{N: 4, C: 2, R: 1, D: 1, p: 1.0},  // More corrupt nodes
+	start := time.Now()
+
+	tests := []BenchmarkConfig{
+		{N: 10, C: 2, R: 3, D: 1, p: 0.8},
+		{N: 10, C: 4, R: 3, D: 2, p: 0.8},
+		{N: 15, C: 5, R: 2, D: 1, p: 0.6},
+		{N: 15, C: 10, R: 2, D: 2, p: 0.6},
+		{N: 20, C: 10, R: 2, D: 1, p: 0.4},
+		{N: 20, C: 15, R: 2, D: 2, p: 0.4},
+		{N: 25, C: 10, R: 1, D: 1, p: 0.2},
+		{N: 25, C: 15, R: 1, D: 2, p: 0.2},
 	}
 
 	file, err := os.Create("benchmark_results.csv")
@@ -36,48 +43,75 @@ func main() {
 	writer := csv.NewWriter(file)
 	defer writer.Flush()
 
-	writer.Write([]string{"System", "N", "C", "R", "D", "p", "Time(s)", "TxSent", "TxConfirmed", "AvgConfidence", "Winner"})
+	// Headers
+	writer.Write([]string{
+		"Simulation Type",
+		"Total Nodes",
+		"Corrupt Nodes",
+		"Corrupt %",
+		"Rounds",
+		"Broadcast Probability",
+		"Difficulty",
+		"txSent",
+		"txConfirmed",
+		"txConfirmed %",
+		"Time (s)",
+		"Winner",
+		"avgConf_Honest",
+		"avgConf_Corrupt",
+	})
 
-	for _, cfg := range configs {
-		// Simulate PoW
-		fmt.Printf("Running PoW: N=%d C=%d R=%d D=%d p=%.2f\n", cfg.N, cfg.C, cfg.R, cfg.D, cfg.p)
-		start := time.Now()
-		txSent, txConfirmed, winner := SimulateBlockchainBenchmark(cfg.N, cfg.C, cfg.R, cfg.D, cfg.p)
-		duration := float64(time.Since(start).Microseconds()) / 1000.0
+	num := 0
+	fmt.Printf("Total Tests = %d\n", len(tests))
+	for _, t := range tests {
+		num += 1
+		fmt.Printf("Running Test #%d: N=%d C=%d R=%d D=%d p=%.2f\n", num, t.N, t.C, t.R, t.D, t.p)
+
+		// Test PoW
+		N, C, corruptPercentage, R, D, txSent, txConfirmed, txConfirmedPercentage, winnerType, duration :=
+			SimulateBlockchain(t.N, t.C, t.R, t.D, t.p, false)
+
 		writer.Write([]string{
 			"PoW",
-			strconv.Itoa(cfg.N),
-			strconv.Itoa(cfg.C),
-			strconv.Itoa(cfg.R),
-			strconv.Itoa(cfg.D),
-			fmt.Sprintf("%.2f", cfg.p),
-			fmt.Sprintf("%.2f", duration),
+			strconv.Itoa(N),
+			strconv.Itoa(C),
+			fmt.Sprintf("%.2f", corruptPercentage),
+			strconv.Itoa(R),
+			fmt.Sprintf("%.2f", t.p),
+			strconv.Itoa(D),
 			strconv.Itoa(txSent),
 			strconv.Itoa(txConfirmed),
-			"",
-			winner,
+			fmt.Sprintf("%.2f", txConfirmedPercentage),
+			fmt.Sprintf("%.2f", duration.Seconds()),
+			winnerType,
 		})
 
-		// Simulate DAG
-		fmt.Printf("Running DAG: N=%d C=%d R=%d D=%d p=%.2f\n", cfg.N, cfg.C, cfg.R, cfg.D, cfg.p)
-		start = time.Now()
-		txSentDAG, txConfirmedDAG, avgConf := SimulateDAGBenchmark(cfg.N, cfg.C, cfg.R, cfg.D, cfg.p)
-		duration = float64(time.Since(start).Microseconds()) / 1000.0
+		// Test DAG
+		avgConf_Honest := 0.0
+		avgConf_Corrupt := 0.0
+
+		N, C, corruptPercentage, R, D, txSent, txConfirmed, txConfirmedPercentage, winnerType, duration, avgConf_Honest, avgConf_Corrupt =
+			SimulateDAG(t.N, t.C, t.R, t.D, t.p, false)
+
 		writer.Write([]string{
 			"DAG",
-			strconv.Itoa(cfg.N),
-			strconv.Itoa(cfg.C),
-			strconv.Itoa(cfg.R),
-			strconv.Itoa(cfg.D),
-			fmt.Sprintf("%.2f", cfg.p),
-			fmt.Sprintf("%.2f", duration),
-			strconv.Itoa(txSentDAG),
-			strconv.Itoa(txConfirmedDAG),
-			fmt.Sprintf("%.2f", avgConf),
-			"",
+			strconv.Itoa(N),
+			strconv.Itoa(C),
+			fmt.Sprintf("%.2f", corruptPercentage),
+			strconv.Itoa(R),
+			fmt.Sprintf("%.2f", t.p),
+			strconv.Itoa(D),
+			strconv.Itoa(txSent),
+			strconv.Itoa(txConfirmed),
+			fmt.Sprintf("%.2f", txConfirmedPercentage),
+			fmt.Sprintf("%.2f", duration.Seconds()),
+			winnerType,
+			fmt.Sprintf("%.2f", avgConf_Honest),
+			fmt.Sprintf("%.2f", avgConf_Corrupt),
 		})
-		fmt.Println()
+
 	}
 
-	fmt.Println("Benchmarking complete. Results saved to benchmark_results.csv")
+	duration := time.Since(start)
+	fmt.Println("Total Test Time =", duration)
 }
