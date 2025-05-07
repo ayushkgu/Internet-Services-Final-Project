@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 func computeHash(tx Transaction) string {
@@ -55,6 +56,16 @@ func pickParents(Nodes []Transaction) []string {
 	return par
 }
 
+func isHonest(name string) bool {
+	h := "honest"
+	return len(name) > len(h) && name[0:len(h)] == h
+}
+
+func isCorrupt(name string) bool {
+	c := "corrupt"
+	return len(name) > len(c) && name[0:len(c)] == c
+}
+
 /*
 	N = total number of nodes
 	C = number of corrupt nodes
@@ -63,13 +74,16 @@ func pickParents(Nodes []Transaction) []string {
 	p = transaction reach {0 <= p <= 1} (i.e. p = 0.5 means each transaction reaches ~50% of nodes)
 */
 
-func SimulateDAG(N, C, R, D int, p float64) {
+func SimulateDAG(N, C, R, D int, p float64, verbose bool) (int, int, float64, int, int, int, int, float64, string, time.Duration, float64, float64) {
+	start := time.Now()
+
 	var wg sync.WaitGroup
 	wg.Add(N)
 
 	// Note: DAG doesn't have Blocks, Transactions are the only object
 	inboxes := make([]chan Transaction, N)
 	receivers := make([]chan Transaction, N)
+	var mu sync.Mutex
 	var G = createGenesis(D)
 	G1, G2 := G[0], G[1]
 	G1.Hash = "gen1"
@@ -148,7 +162,7 @@ func SimulateDAG(N, C, R, D int, p float64) {
 			for key := range HashMap {
 				Tips[key] = struct{}{}
 			}
-			// fmt.Println(len(Tips), len(HashMap))
+
 			for _, val := range HashMap {
 				if len(val.Parents) < 2 {
 					continue
@@ -181,6 +195,7 @@ func SimulateDAG(N, C, R, D int, p float64) {
 			}
 
 			// Aggregate Results
+			mu.Lock() // Apply lock to make sure multiple go routines don't simultaneously write to the map
 			for k := range Confidence {
 				_, exists := transactionTracker[HashMap[k].Amount]
 				if !exists {
@@ -189,13 +204,16 @@ func SimulateDAG(N, C, R, D int, p float64) {
 				}
 				transactionTracker[HashMap[k].Amount] = transactionTracker[HashMap[k].Amount] + 1
 			}
-
+			mu.Unlock()
 		}()
 	}
 
-	SendTransactions(N, C, R, inboxes, p) // same function from pow.go
+	txSent := SendTransactions(N, C, R, inboxes, p) // same function from pow.go
 
 	wg.Wait()
+
+	corruptPercentage := getPercentage(C, N)
+	duration := time.Since(start)
 
 	// Output Results
 	type kv struct {
@@ -212,166 +230,67 @@ func SimulateDAG(N, C, R, D int, p float64) {
 		return sortedConfidence[i].Value > sortedConfidence[j].Value
 	})
 
-	fmt.Println("Transaction Confidence Levels:\n===============================")
+	totalConfidence := 0
+	honestCount := 0
+	corruptCount := 0
+	honestConfidence := 0
+	corruptConfidence := 0
 	for _, kv := range sortedConfidence {
-		fmt.Printf("Transaction: %s, Confidence: %d\n", formatTransaction(kv.Key), kv.Value)
-	}
-
-}
-
-// SimulateDAGBenchmark simulates a DAG-based blockchain benchmark
-func SimulateDAGBenchmark(N, C, R, D int, p float64) (txSent int, txConfirmed int, avgConfidence float64) {
-	var wg sync.WaitGroup
-	wg.Add(N)
-
-	inboxes := make([]chan Transaction, N)
-	receivers := make([]chan Transaction, N)
-	var G = createGenesis(D)
-	G1, G2 := G[0], G[1]
-	G1.Hash = "gen1"
-	G2.Hash = "gen2"
-
-	for i := 0; i < N; i++ {
-		inboxes[i] = make(chan Transaction, 100)
-		receivers[i] = make(chan Transaction, 100)
-	}
-
-	var mu sync.Mutex
-	confidenceScores := []int{}
-	transactionTracker := make(map[float64]bool)
-
-	for i := 0; i < N; i++ {
-		go func(i int) {
-			defer wg.Done()
-			HashMap := map[string]Transaction{
-				G1.Hash: G1,
-				G2.Hash: G2,
-			}
-			Nodes := []Transaction{G1, G2}
-			transactions := []Transaction{}
-			exit := false
-
-			for !exit {
-				select {
-				case t, ok := <-receivers[i]:
-					if ok {
-						_, ok1 := HashMap[t.Parents[0]]
-						_, ok2 := HashMap[t.Parents[1]]
-						if ok1 && ok2 {
-							HashMap[t.Hash] = t
-							Nodes = append(Nodes, t)
-						}
-					}
-				case t, ok := <-inboxes[i]:
-					if ok {
-						transactions = append(transactions, t)
-					} else {
-						exit = true
-					}
-				default:
-					if len(transactions) > 0 {
-						t := transactions[len(transactions)-1]
-						transactions = transactions[:len(transactions)-1]
-						t.Parents = pickParents(Nodes)
-						t = mineTransaction(t, D)
-						HashMap[t.Hash] = t
-						Nodes = append(Nodes, t)
-
-						l1 := getLabel(i, C)
-						for j := 0; j < N; j++ {
-							l2 := getLabel(j, C)
-							if i == j || (l1 == "corrupt" && l2 == "honest") {
-								continue
-							}
-							select {
-							case receivers[j] <- t:
-							default:
-							}
-						}
-					}
-				}
-			}
-
-			Confidence := make(map[string]int)
-			Tips := map[string]struct{}{}
-			for h := range HashMap {
-				Tips[h] = struct{}{}
-			}
-			for _, val := range HashMap {
-				if len(val.Parents) < 2 {
-					continue
-				}
-				delete(Tips, val.Parents[0])
-				delete(Tips, val.Parents[1])
-			}
-			for tip := range Tips {
-				visited := map[string]struct{}{}
-				var dfs func(string)
-				dfs = func(h string) {
-					if _, seen := visited[h]; seen {
-						return
-					}
-					visited[h] = struct{}{}
-					Confidence[h]++
-					for _, p := range HashMap[h].Parents {
-						dfs(p)
-					}
-				}
-				dfs(tip)
-			}
-
-			mu.Lock()
-			for h, score := range Confidence {
-				tx := HashMap[h]
-				if !transactionTracker[tx.Amount] {
-					txConfirmed++
-					confidenceScores = append(confidenceScores, score)
-					transactionTracker[tx.Amount] = true
-				}
-			}
-			mu.Unlock()
-		}(i)
-	}
-
-	// Count and send transactions
-	amt := 1.0
-	for round := 0; round < R; round++ {
-		for i := 0; i < N; i++ {
-			for j := 0; j < N; j++ {
-				if i == j {
-					continue
-				}
-				l1 := getLabel(i, C)
-				l2 := getLabel(j, C)
-				if l1 != l2 {
-					continue
-				}
-				if rand.Float64() <= p {
-					tx := Transaction{
-						Sender:   fmt.Sprintf("%s%d", l1, getNum(i, C)),
-						Receiver: fmt.Sprintf("%s%d", l2, getNum(j, C)),
-						Amount:   amt,
-					}
-					inboxes[i] <- tx
-					txSent++
-					amt += 0.01
-				}
-			}
+		totalConfidence += kv.Value
+		if isHonest(kv.Key.Sender) {
+			honestCount += 1
+			honestConfidence += kv.Value
+		} else if isCorrupt(kv.Key.Sender) {
+			corruptCount += 1
+			corruptConfidence += kv.Value
 		}
 	}
-	for i := 0; i < N; i++ {
-		close(inboxes[i])
+
+	avgConf_Honest := 0.0
+	if honestCount > 0 {
+		avgConf_Honest = float64(honestConfidence) / float64(honestCount)
+	}
+	avgConf_Corrupt := 0.0
+	if corruptCount > 0 {
+		avgConf_Corrupt = float64(corruptConfidence) / float64(corruptCount)
 	}
 
-	wg.Wait()
+	txConfirmed := 0
+	avgConfidence := float64(totalConfidence) / float64(len(sortedConfidence))
 
-	if len(confidenceScores) > 0 {
-		sum := 0
-		for _, s := range confidenceScores {
-			sum += s
+	for _, kv := range sortedConfidence {
+		if float64(kv.Value) >= avgConfidence {
+			txConfirmed += 1
 		}
-		avgConfidence = float64(sum) / float64(len(confidenceScores))
 	}
 
-	return txSent, txConfirmed, avgConfidence
+	txConfirmedPercentage := getPercentage(txConfirmed, txSent)
+	winnerType := "honest"
+	if avgConf_Corrupt > avgConf_Honest {
+		winnerType = "corrupt"
+	}
+
+	// Print Result
+	if verbose {
+		fmt.Println("Transaction Confidence Levels:\n===============================")
+		for _, kv := range sortedConfidence {
+			fmt.Printf("Transaction: %s, Confidence: %d\n", formatTransaction(kv.Key), kv.Value)
+		}
+
+		fmt.Println("\nTotal nodes        =", N)
+		fmt.Println("Corrupt nodes      =", C)
+		fmt.Println("Corrupt %          =", corruptPercentage)
+		fmt.Println("Rounds             =", R)
+		fmt.Println("Difficulty         =", D)
+		fmt.Println("txSent             =", txSent)
+		fmt.Println("txConfirmed        =", txConfirmed)
+		fmt.Println("txConfirmed %      =", txConfirmedPercentage)
+		fmt.Println("Winner             =", winnerType)
+		fmt.Printf("Duration (s)        = %.2f\n", duration.Seconds())
+		fmt.Printf("avgConf_Honest      = %.2f\n", avgConf_Honest)
+		fmt.Printf("avgConf_Corrupt     = %.2f\n", avgConf_Corrupt)
+	}
+
+	return N, C, corruptPercentage, R, D, txSent, txConfirmed, txConfirmedPercentage, winnerType, duration, avgConf_Honest, avgConf_Corrupt
+
 }

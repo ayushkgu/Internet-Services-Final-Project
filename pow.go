@@ -4,9 +4,11 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"math"
 	"math/rand/v2"
 	"strings"
 	"sync"
+	"time"
 )
 
 type Block struct {
@@ -98,7 +100,7 @@ func getNum(index, C int) int {
 	return index + 1 - C
 }
 
-func SendTransactions(N, C, R int, inboxes []chan Transaction, p float64) {
+func SendTransactions(N, C, R int, inboxes []chan Transaction, p float64) (txSent int) {
 	amt := 1.0
 	for range R {
 		honestTxs := []Transaction{}
@@ -115,6 +117,7 @@ func SendTransactions(N, C, R int, inboxes []chan Transaction, p float64) {
 				}
 				// Create transaction from node i to node j
 				if rand.Float64() <= p { // p = probability of sending
+					txSent += 1
 					if l1 == "honest" {
 						honestTxs = append(honestTxs, Transaction{
 							Sender:   fmt.Sprintf("%s%d", l1, getNum(i, C)),
@@ -145,10 +148,15 @@ func SendTransactions(N, C, R int, inboxes []chan Transaction, p float64) {
 					inboxes[i] <- honestTxs[t]
 				}
 			}
-			// Close inbox after sending transactions
-			close(inboxes[i])
 		}
 	}
+
+	// Close inbox after sending transactions
+	for i := range N {
+		close(inboxes[i])
+	}
+
+	return txSent
 }
 
 func buildBlockChain(HashMap map[string]Block, genesis Block, tail string) []Block {
@@ -172,6 +180,22 @@ func buildBlockChain(HashMap map[string]Block, genesis Block, tail string) []Blo
 	return Blockchain
 }
 
+func countConfirmedTransactions(Blockchain []Block) int {
+	txs := make(map[float64]struct{})
+	for _, b := range Blockchain {
+		for _, t := range b.Transactions {
+			txs[t.Amount] = struct{}{}
+		}
+	}
+	return len(txs)
+}
+
+func getPercentage(a, b int) float64 {
+	percent := 100.0 * float64(a) / float64(b)
+	rounded := math.Round(percent*100) / 100
+	return rounded
+}
+
 /*
 	N = total number of nodes
 	C = number of corrupt nodes
@@ -180,7 +204,9 @@ func buildBlockChain(HashMap map[string]Block, genesis Block, tail string) []Blo
 	p = transaction reach {0 <= p <= 1} (i.e. p = 0.5 means each transaction reaches ~50% of nodes)
 */
 
-func SimulateBlockchain(N, C, R, D int, p float64) {
+func SimulateBlockchain(N, C, R, D int, p float64, verbose bool) (int, int, float64, int, int, int, int, float64, string, time.Duration) {
+	start := time.Now()
+
 	var wg sync.WaitGroup
 	wg.Add(N)
 
@@ -280,7 +306,7 @@ func SimulateBlockchain(N, C, R, D int, p float64) {
 	}
 
 	// Send transactions
-	SendTransactions(N, C, R, inboxes, p)
+	txSent := SendTransactions(N, C, R, inboxes, p)
 
 	// Wait until all nodes are finished processing blocks before closing receivers
 	blockWG.Wait()
@@ -293,92 +319,25 @@ func SimulateBlockchain(N, C, R, D int, p float64) {
 	// Wait until all nodes are finished processing blocks before ending the simulation
 	wg.Wait()
 
+	corruptPercentage := getPercentage(C, N)
+	txConfirmed := countConfirmedTransactions(winner)
+	txConfirmedPercentage := getPercentage(txConfirmed, txSent)
+	duration := time.Since(start)
+
 	// Print Result
-	printBlockchain(winner)
-	fmt.Println("\nTotal nodes   =", N)
-	fmt.Println("Corrupt nodes =", C)
-	fmt.Println("Rounds        =", R)
-	fmt.Println("Difficulty    =", D)
-	fmt.Println("Winner        =", winnerType)
-}
-
-
-// SimulateBlockchainBenchmark simulates a blockchain benchmark
-func SimulateBlockchainBenchmark(N, C, R, D int, p float64) (txSent int, txConfirmed int, winner string) {
-	inboxes := make([]chan Transaction, N)
-	for i := range N {
-		inboxes[i] = make(chan Transaction, 100)
+	if verbose {
+		printBlockchain(winner)
+		fmt.Println("\nTotal nodes        =", N)
+		fmt.Println("Corrupt nodes      =", C)
+		fmt.Println("Corrupt %          =", corruptPercentage)
+		fmt.Println("Rounds             =", R)
+		fmt.Println("Difficulty         =", D)
+		fmt.Println("txSent             =", txSent)
+		fmt.Println("txConfirmed        =", txConfirmed)
+		fmt.Println("txConfirmed %      =", txConfirmedPercentage)
+		fmt.Println("Winner             =", winnerType)
+		fmt.Printf("Duration (s)        = %.2f\n", duration.Seconds())
 	}
 
-	amt := 1.0
-	for round := 0; round < R; round++ {
-		for i := 0; i < N; i++ {
-			for j := 0; j < N; j++ {
-				if i == j {
-					continue
-				}
-				l1 := getLabel(i, C)
-				l2 := getLabel(j, C)
-				if l1 != l2 {
-					continue
-				}
-				if rand.Float64() <= p {
-					tx := Transaction{
-						Sender:   fmt.Sprintf("%s%d", l1, getNum(i, C)),
-						Receiver: fmt.Sprintf("%s%d", l2, getNum(j, C)),
-						Amount:   amt,
-					}
-					amt += 0.01
-					inboxes[i] <- tx
-					txSent++
-				}
-			}
-		}
-	}
-	for i := range N {
-		close(inboxes[i])
-	}
-
-	var wg sync.WaitGroup
-	wg.Add(N)
-	receivers := make([]chan Block, N)
-	genesis := createGenesisBlock(D)
-
-	var winnerChain []Block
-	var winnerType string
-	var winnerMu sync.Mutex
-
-	for i := 0; i < N; i++ {
-		receivers[i] = make(chan Block, N)
-		go func(i int) {
-			defer wg.Done()
-			HashMap := map[string]Block{genesis.Hash: genesis}
-			Counts := make(map[string]int)
-			MaxChain := genesis.Hash
-			txs := []Transaction{}
-			for tx := range inboxes[i] {
-				txs = append(txs, tx)
-			}
-			if len(txs) > 0 {
-				block := generateBlock(MaxChain, txs, D)
-				HashMap[block.Hash] = block
-				Counts[block.Hash] = Counts[block.PrevHash] + 1
-				MaxChain = block.Hash
-			}
-			chain := buildBlockChain(HashMap, genesis, MaxChain)
-			winnerMu.Lock()
-			if len(chain) > len(winnerChain) {
-				winnerChain = chain
-				winnerType = getLabel(i, C)
-			}
-			winnerMu.Unlock()
-		}(i)
-	}
-	wg.Wait()
-
-	for _, b := range winnerChain {
-		txConfirmed += len(b.Transactions)
-	}
-
-	return txSent, txConfirmed, winnerType
+	return N, C, corruptPercentage, R, D, txSent, txConfirmed, txConfirmedPercentage, winnerType, duration
 }
